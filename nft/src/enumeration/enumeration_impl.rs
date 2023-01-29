@@ -10,7 +10,7 @@ impl NonFungibleToken {
     /// Helper function used by a enumerations methods
     /// Note: this method is not exposed publicly to end users
     fn enum_get_token(&self, owner_id: AccountId, token_id: TokenId) -> Token {
-        let metadata = self.token_metadata_by_id.as_ref().and_then(|m| m.get(&token_id));
+        let metadata = self.token_metadata_by_id.get(&token_id).unwrap();
         let approved_account_ids = self
             .approvals_by_id
             .as_ref()

@@ -4,10 +4,11 @@ use crate::nft_core::resolver::ext_nft_resolver;
 use crate::nft_core::NonFungibleTokenCore;
 use crate::events::{NftTransfer};
 use crate::metadata::TokenMetadata;
+use crate::series::{TokenSeriesId, TokenSeries};
 use crate::token::{Token, TokenId};
 use crate::utils::{refund_approved_account_ids, refund_deposit_to_account};
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::collections::{LookupMap, TreeMap, UnorderedSet};
+use near_sdk::collections::{LookupMap, TreeMap, UnorderedSet, UnorderedMap};
 use near_sdk::json_types::Base64VecU8;
 use near_sdk::{
     assert_one_yocto, env, require, AccountId, BorshStorageKey, Gas, IntoStorageKey,
@@ -15,6 +16,7 @@ use near_sdk::{
 };
 use std::collections::HashMap;
 
+pub const TOKEN_DELIMETER: char = ':';
 const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas(5_000_000_000_000);
 const GAS_FOR_NFT_TRANSFER_CALL: Gas = Gas(25_000_000_000_000 + GAS_FOR_RESOLVE_TRANSFER.0);
 
@@ -39,7 +41,7 @@ pub struct NonFungibleToken {
     pub owner_by_id: TreeMap<TokenId, AccountId>,
 
     // required by metadata extension
-    pub token_metadata_by_id: Option<LookupMap<TokenId, TokenMetadata>>,
+    pub token_metadata_by_id: LookupMap<TokenId, TokenMetadata>,
 
     // required by enumeration extension
     pub tokens_per_owner: Option<LookupMap<AccountId, UnorderedSet<TokenId>>>,
@@ -58,7 +60,7 @@ impl NonFungibleToken {
     pub fn new<Q, R, S, T>(
         owner_by_id_prefix: Q,
         owner_id: AccountId,
-        token_metadata_prefix: Option<R>,
+        token_metadata_prefix: R,
         enumeration_prefix: Option<S>,
         approval_prefix: Option<T>,
     ) -> Self
@@ -82,7 +84,7 @@ impl NonFungibleToken {
             owner_id,
             extra_storage_in_bytes_per_token: 0,
             owner_by_id: TreeMap::new(owner_by_id_prefix),
-            token_metadata_by_id: token_metadata_prefix.map(LookupMap::new),
+            token_metadata_by_id: LookupMap::new(token_metadata_prefix),
             tokens_per_owner: enumeration_prefix.map(LookupMap::new),
             approvals_by_id,
             next_approval_id_by_id,
@@ -100,25 +102,25 @@ impl NonFungibleToken {
 
         // 1. set some dummy data
         self.owner_by_id.insert(&tmp_token_id, &tmp_owner_id);
-        if let Some(token_metadata_by_id) = &mut self.token_metadata_by_id {
-            token_metadata_by_id.insert(
-                &tmp_token_id,
-                &TokenMetadata {
-                    title: Some("a".repeat(64)),
-                    description: Some("a".repeat(64)),
-                    media: Some("a".repeat(64)),
-                    media_hash: Some(Base64VecU8::from("a".repeat(64).as_bytes().to_vec())),
-                    copies: Some(1),
-                    issued_at: None,
-                    expires_at: None,
-                    starts_at: None,
-                    updated_at: None,
-                    extra: None,
-                    reference: None,
-                    reference_hash: None,
-                },
-            );
-        }
+
+        self.token_metadata_by_id.insert(
+            &tmp_token_id,
+            &TokenMetadata {
+                title: Some("a".repeat(64)),
+                description: Some("a".repeat(64)),
+                media: Some("a".repeat(64)),
+                media_hash: Some(Base64VecU8::from("a".repeat(64).as_bytes().to_vec())),
+                copies: Some(1),
+                issued_at: None,
+                expires_at: None,
+                starts_at: None,
+                updated_at: None,
+                extra: None,
+                reference: None,
+                reference_hash: None,
+            },
+        );
+
         if let Some(tokens_per_owner) = &mut self.tokens_per_owner {
             let u = &mut UnorderedSet::new(StorageKey::TokensPerOwner {
                 account_hash: env::sha256(tmp_owner_id.as_bytes()),
@@ -149,9 +151,8 @@ impl NonFungibleToken {
             let mut u = tokens_per_owner.remove(&tmp_owner_id).unwrap();
             u.remove(&tmp_token_id);
         }
-        if let Some(token_metadata_by_id) = &mut self.token_metadata_by_id {
-            token_metadata_by_id.remove(&tmp_token_id);
-        }
+        self.token_metadata_by_id.remove(&tmp_token_id);
+
         self.owner_by_id.remove(&tmp_token_id);
     }
 
@@ -274,17 +275,17 @@ impl NonFungibleToken {
     /// * token_id must be unique
     ///
     /// Returns the newly minted token
-    #[deprecated(since = "4.0.0", note = "mint is deprecated, please use internal_mint instead.")]
-    pub fn mint(
-        &mut self,
-        token_id: TokenId,
-        token_owner_id: AccountId,
-        token_metadata: Option<TokenMetadata>,
-    ) -> Token {
-        assert_eq!(env::predecessor_account_id(), self.owner_id, "Unauthorized");
-
-        self.internal_mint(token_id, token_owner_id, token_metadata)
-    }
+    // #[deprecated(since = "4.0.0", note = "mint is deprecated, please use internal_mint instead.")]
+    // pub fn mint(
+    //     &mut self,
+    //     contract: &Contract,
+    //     token_id: TokenId,
+    //     token_owner_id: AccountId,
+    //     token_metadata: TokenMetadata,
+    // ) -> Token {
+    //     assert_eq!(env::predecessor_account_id(), self.owner_id, "Unauthorized");
+    //     self.internal_mint(contract, token_id, token_owner_id, token_metadata)
+    // }
 
     /// Mint a new token without checking:
     /// * Whether the caller id is equal to the `owner_id`
@@ -293,14 +294,28 @@ impl NonFungibleToken {
     /// Returns the newly minted token and emits the mint event
     pub fn internal_mint(
         &mut self,
-        token_id: TokenId,
+        token_series_by_id: &mut UnorderedMap<TokenSeriesId, TokenSeries>,
+        token_series_id: TokenSeriesId,
         token_owner_id: AccountId,
-        token_metadata: Option<TokenMetadata>,
     ) -> Token {
+        let mut token_series = token_series_by_id.get(&token_series_id).expect("FireFly: Token series not exist");
+        assert!(token_series.is_mintable, "FireFly: Token series is not mintable");
+        let num_tokens = token_series.tokens.len();
+        let max_copies = token_series.metadata.copies.unwrap_or(u64::MAX);
+        assert!(num_tokens < max_copies, "Series supply maxed");
+
+        if (num_tokens + 1) >= max_copies {
+            token_series.is_mintable = false;
+            token_series.price = None;
+        }
+
+        let token_id = format!("{}{}{}", &token_series_id, TOKEN_DELIMETER, num_tokens + 1);
+        token_series.tokens.insert(&token_id);
+        token_series_by_id.insert(&token_series_id, &token_series);
         let token = self.internal_mint_with_refund(
             token_id,
             token_owner_id,
-            token_metadata,
+            token_series.metadata,
             Some(env::predecessor_account_id()),
         );
         // NftMint { owner_id: &token.owner_id, token_ids: &[&token.token_id], memo: None }.emit();
@@ -318,15 +333,12 @@ impl NonFungibleToken {
         &mut self,
         token_id: TokenId,
         token_owner_id: AccountId,
-        token_metadata: Option<TokenMetadata>,
+        token_metadata: TokenMetadata,
         refund_id: Option<AccountId>,
     ) -> Token {
         // Remember current storage usage if refund_id is Some
         let initial_storage_usage = refund_id.map(|account_id| (account_id, env::storage_usage()));
 
-        if self.token_metadata_by_id.is_some() && token_metadata.is_none() {
-            env::panic_str("Must provide metadata");
-        }
         if self.owner_by_id.get(&token_id).is_some() {
             env::panic_str("token_id must be unique");
         }
@@ -339,9 +351,7 @@ impl NonFungibleToken {
         // Metadata extension: Save metadata, keep variable around to return later.
         // Note that check above already panicked if metadata extension in use but no metadata
         // provided to call.
-        self.token_metadata_by_id
-            .as_mut()
-            .and_then(|by_id| by_id.insert(&token_id, token_metadata.as_ref().unwrap()));
+        self.token_metadata_by_id.insert(&token_id, &token_metadata);
 
         // Enumeration extension: Record tokens_per_owner for use with enumeration view methods.
         if let Some(tokens_per_owner) = &mut self.tokens_per_owner {
@@ -408,7 +418,7 @@ impl NonFungibleTokenCore for NonFungibleToken {
 
     fn nft_token(&self, token_id: TokenId) -> Option<Token> {
         let owner_id = self.owner_by_id.get(&token_id)?;
-        let metadata = self.token_metadata_by_id.as_ref().and_then(|by_id| by_id.get(&token_id));
+        let metadata = self.token_metadata_by_id.get(&token_id).unwrap();
         let approved_account_ids = self
             .approvals_by_id
             .as_ref()
